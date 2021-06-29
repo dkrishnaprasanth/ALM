@@ -1,0 +1,588 @@
+Query to get the failed step analysis and linked defects.
+Select Master_Table.cfpath as TESTCASE_PATH,
+       Master_Table.cy_cycle as TEST_SET ,
+       Master_Table.TC_TEST_ID as TEST_ID,
+       Master_Table.TS_NAME as TEST_CASE_NAME,
+       RN_TESTER_NAME as TESTER,
+       RUN.RN_EXECUTION_DATE as EXECUTED_ON,
+       RN_STATUS as STATUS,
+       ST_STEP_NAME AS STEP_NAME,
+       ST_STATUS as STEP_STATUS,
+       ST_DESCRIPTION as STEP_DESCRIPTION,
+       LN_BUG_ID as DEFECT_ID,
+       (select bg_status from bug where LN_BUG_ID = bg_bug_id) as "Bug Status"
+FROM
+    (//Table to Get the RunID of the scripts mentioned in the path
+       Select distinct cfpath ,
+                      cy_cycle ,
+                      TS_NAME ,
+                      TC_TEST_ID,
+                      max(RN_RUN_ID) as Latest_Run_ID
+       FROM(
+
+       select cy_cycle_id,
+              cy_cycle,
+              cfpath
+       FROM (
+                             -- 1 Get full path (test lab folders)
+                             SELECT cf_Item_id,
+                             sys_connect_by_path(cf.CF_ITEM_NAME,'\') as cfpath
+                             from CYCL_FOLD cf
+                             start with cf.CF_FATHER_ID = '0'
+                             connect by nocycle prior cf.CF_ITEM_ID = cf.CF_FATHER_ID
+                             -- 1 end
+       ), Cycle
+      where cy_folder_id = cf_item_id
+      and cfpath like  @Target_Test_Set_Folder@
+
+    ) , testcycl,RUN,Test
+  where cy_cycle_id = tc_cycle_id and
+        RN_CYCLE_ID = TC_CYCLE_ID  and
+        RN_TESTCYCL_ID =   TC_TESTCYCL_ID and
+        TC_TEST_ID = TS_TEST_ID
+  Group by cfpath, cy_cycle ,tc_test_id,TS_NAME
+  order by cfpath, cy_cycle
+) Master_Table  inner join RUN on Master_Table.Latest_Run_ID = RUN.RN_RUN_ID
+                inner join STEP on ST_RUN_ID = RUN.RN_RUN_ID and ST_STATUS = 'Failed' left outer join LINK on  (RN_RUN_ID = LN_ENTITY_ID and LN_ENTITY_TYPE = 'RUN') or
+        (ST_RUN_ID = LN_ENTITY_ID and LN_ENTITY_TYPE = 'STEP') or
+        (RN_CYCLE_ID = LN_ENTITY_ID and LN_ENTITY_TYPE = 'CYCLE')  or
+        (RN_TESTCYCL_ID = LN_ENTITY_ID and LN_ENTITY_TYPE = 'TESTCYCL')
+
+Defects resolved report by Subteam
+Query 1
+
+-- add week info and identify if it should be count.
+  Select defectid, m_date_opened,m_date_closed, to_char(m_date_closed,'IW') as week_closed, m_current_status, m_Subteam, m_date_subteam, to_char(m_date_subteam, 'IW') as Week_subteam, m_date_resolved, to_char(m_date_resolved,'IW') as week_resolved, m_date_reopen, to_char(m_date_reopen,'IW') as Week_reopen, to_char(sysdate,'IW') as Current_week,
+  (Case when M_Subteam = @SubTeam@ and m_date_resolved >= m_date_reopen and m_date_resolved >= m_date_subteam Then  to_char(m_date_resolved,'IW') end) as WW_resolved_to_count,
+  (Case when M_Subteam = @SubTeam@ and m_date_resolved >= m_date_reopen and m_date_resolved >= m_date_subteam Then  1
+  when to_char(m_date_reopen,'IW')= ' ' and m_date_resolved >= m_date_subteam then 1 end) as Process_to_count,
+  (case when m_current_status = 'Open' and m_subteam = @SubTeam@ then 1 else 0 end) as open_During_Subteam
+ From
+ (
+ -- Consolidate info
+Select Distinct BG_BUG_id as defectid, MAX(Date_OPENED) as M_Date_OPENED, MAX(DATE_CLOSED) as M_DATE_CLOSED, MAX(Current_STATUS) as M_CURRENT_STATUS, MAX(SUBTEAM)as m_SUBTEAM, MAX(Date_Assigned_Subteam) as M_DATE_SUBTEAM, MAX(DATE_RESOLVED) as M_DATE_RESOLVED, max(DATE_REOPEN) as M_DATE_REOPEN, MAX(DATE_ASSIGNED) as M_DATE_ASSIGNED -- MAX(REF_ACTION) as M_REF_ACTION
+From (
+-- Get all Current for each of the defects, Identify Dates of Actions, cut all those not needed.
+Select BG_BUG_ID,   BG_DETECTION_DATE as date_Opened,
+ (Case When BG_STatus <> 'Closed' Then 'Open'
+       when  BG_Status = 'Resolved' then 'Resolved'
+       when BG_Status = 'Closed' then BG_Status end) as Current_status,
+  (Case When BG_STatus = 'Closed' then BG_CLOSING_DATE end) as DATE_CLOSED,
+  (Case when AP_FIELD_NAME = 'BG_USER_05'  and
+             AP_NEW_VALUE =  @SubTeam@   then AP_NEW_VALUE end) as  Subteam ,
+  (Case when AP_FIELD_NAME = 'BG_USER_05'  and
+             AP_NEW_VALUE = @SubTeam@  then AU_TIME end) as  Date_Assigned_Subteam ,
+  (Case when AP_FIELD_NAME = 'BG_STATUS' and  AP_NEW_VALUE in ('Resolved','Ready for Retest', 'Rejected','Transitioned to Remedy') Then AU_TIME end) as Date_RESOLVED,
+  (Case when AP_FIELD_NAME = 'BG_STATUS' and AP_NEW_VALUE ='Reopen' then AU_TIME end ) as DATE_REOPEN,
+  (Case When AP_FIELD_NAME = 'BG_USER_03' and AP_New_Value = 'Application Build' then AU_TIME end) as date_assigned, Ref_Action
+ from
+bug, (
+--  Get all History for defects assigned to "application Build", cut those not in the cycle requested.
+Select * from
+(
+-- Defects updated
+SELECT * --AU_Entity_id as Defect_id, AU_TIME as Ref_date, AU_Action_ID as Ref_Action
+FROM  Audit_log log,Audit_Properties  prop
+where
+      AP_Table_name = 'BUG' and
+      LOG.AU_ACTION_ID = PROP.AP_ACTION_ID
+) ,
+(-- Defects assigned to Application Build
+SELECT AU_Entity_id as Defect_id, AU_TIME as Ref_date, AU_Action_ID as Ref_Action
+FROM  Audit_log log1,Audit_Properties  prop1
+where AP_New_Value = 'Application Build'   and
+      AP_Field_Name = 'BG_USER_03' and
+      LOG1.AU_ACTION_ID = PROP1.AP_ACTION_ID
+ ),
+ (
+ Select Distinct BG_BUG_id as defectid
+  FROM   BUG,  RELEASE_CYCLES
+  WHERE RCYC_NAME = @ReleaseCycle@  AND
+      BUG.BG_DETECTED_IN_RCYC = RELEASE_CYCLES.RCYC_ID
+      ORDER BY BUG.BG_BUG_ID
+ )
+where  AU_Entity_ID = Defect_ID and
+       AU_Entity_id = defectid
+ -- End of Get history block
+ )
+  Where   BG_BUG_ID = DEFECT_ID
+           --and BG_STATUS <> 'Rejected' and
+           --  BG_STATUS <> 'Transitioned to Remedy'
+           and BG_STATUS <> 'Transport Released'
+-- end of GET aLL CURRENT INFO
+
+)  Group by   BG_BUG_id
+--
+) order by   defectid
+--  add week info and identify if it should be count
+
+Quer y2
+SELECT   to_number(to_char(sysdate,'IW')) as Current_week, @ReleaseCycle@ as Cycle_in_Search, @SubTeam@ as SubTeam ,to_number(to_char(sysdate,'yyyy'))  as Current_year
+FROM    dual
+Post processing
+Sub QC_PostProcessing()
+Dim MainWorksheet As Worksheet
+' Make sure your worksheet name matches!
+Set MainWorksheet = ActiveWorkbook.Worksheets("Query1")
+Dim DataRange As Range
+Dim lastRow As Long
+Set DataRange = MainWorksheet.UsedRange
+' Now that you have the data in DataRange you can process it.
+lastRow = MainWorksheet.UsedRange.Row - 1 + MainWorksheet.UsedRange.Rows.Count
+
+Worksheets(1).Range("Q2").Formula ="=IF(AND(F2=Query2!C$2,I2>=K2,I2>=G2),J2)"
+ Worksheets(1).Range("Q2").Copy
+    Worksheets(1).Range("Q3:Q" & lastrow).PasteSpecial Paste:=xlPasteFormulas
+
+Worksheets(2).Range("A2").Select
+    Selection.NumberFormat = "0"
+ Worksheets(2).Range("D2").Select
+    Selection.NumberFormat = "0"
+    Worksheets(2).Range("C6:D15").Select
+    Selection.NumberFormat = "0"
+    Worksheets(2).Range("C6").Formula = "=A2"
+    Worksheets(2).Range("C7").Formula = "=C6-1"
+    Worksheets(2).Range("C8").Formula = "=C7-1"
+    Worksheets(2).Range("C9").Formula = "=C8-1"
+    Worksheets(2).Range("C10").Formula = "=C9-1"
+    Worksheets(2).Range("C11").Formula = "=C10-1"
+    Worksheets(2).Range("C12").Formula = "=C11-1"
+    Worksheets(2).Range("C13").Formula = "=C12-1"
+    Worksheets(2).Range("C14").Formula = "=C13-1"
+    Worksheets(2).Range("C15").Formula = "=C14-1"
+    Worksheets(2).Range("D6").Formula = "=COUNTIF(Query1!Q:Q,C6)"
+    Worksheets(2).Range("D7").Formula = "=COUNTIF(Query1!Q:Q,C7)"
+    Worksheets(2).Range("D8").Formula = "=COUNTIF(Query1!Q:Q,C8)"
+    Worksheets(2).Range("D9").Formula = "=COUNTIF(Query1!Q:Q,C9)"
+    Worksheets(2).Range("D10").Formula = "=COUNTIF(Query1!Q:Q,C10)"
+    Worksheets(2).Range("D11").Formula = "=COUNTIF(Query1!Q:Q,C11)"
+    Worksheets(2).Range("D12").Formula = "=COUNTIF(Query1!Q:Q,C12)"
+    Worksheets(2).Range("D13").Formula = "=COUNTIF(Query1!Q:Q,C13)"
+    Worksheets(2).Range("D14").Formula = "=COUNTIF(Query1!Q:Q,C14)"
+    Worksheets(2).Range("D15").Formula = "=COUNTIF(Query1!Q:Q,C15)"
+    Worksheets(2).Range("D3").Value = "Total Open"
+    Worksheets(2).Range("D4").Value = "Open assigned " & Worksheets(2).Range("C2").Value
+    Worksheets(2).Range("B5").Value = "Resolved by " & Worksheets(2).Range("C2").Value & ":"
+    Worksheets(2).Range("C5").Value = "Week #"
+    Worksheets(2).Range("D5").Value = "Quantity"
+    Worksheets(2).Range("E5").Value = "Week Range"
+    Worksheets(2).Range("E3").Formula = "=COUNTIF(Query1!E:E,""Open"")"
+    Worksheets(2).Range("E4").Formula = "=COUNTIF(Query1!P:P,1)"
+    Worksheets(2).Range("E6").Formula = "=DATE(D$2,1,C6*7-2)-WEEKDAY(DATE(D$2,1,3))"
+    Worksheets(2).Range("F6").Formula = "=E6+6"
+    Worksheets(2).Range("E6").Copy
+    Worksheets(2).Range("E7:E15").PasteSpecial Paste:=xlPasteFormulas
+   ' Application.CutCopyMode = False
+    Worksheets(2).Range("F6").Copy
+    Worksheets(2).Range("F7:F15").PasteSpecial Paste:=xlPasteFormulas
+   ' Application.CutCopyMode = False
+   Worksheets(2).Range("E7:F15").Select
+    Selection.NumberFormat = "m/d/yyyy"
+    Worksheets(2).Columns("A:G").EntireColumn.AutoFit
+    Worksheets(2).Columns("A:Q").EntireColumn.AutoFit
+End Sub
+Daily Defect Linkage Metric Generator
+
+SELECT  BUG.BG_SUMMARY            "Defect Summary" ,
+        RELEASE_CYCLES.RCYC_NAME  "CycleName",
+        BUG.BG_BUG_ID             "Defect ID",
+        BUG.BG_USER_01            "Det in Team",
+        BUG.BG_USER_04            "Detected in Sub Team",
+        BUG.BG_USER_03            "Assgn in Team",
+        BUG.BG_USER_05            "Assigned to Sub Team",
+        BUG.BG_SEVERITY           "Severity",
+        BUG.BG_STATUS             "Defect Status",
+        BUG.BG_USER_06            "Type",
+        TEST.TS_USER_01           "Team",
+        TEST.TS_USER_02           "Sub_Team",
+        TESTCYCL.TC_STATUS        "TestCase Status",
+        CYCLE.CY_CYCLE            "Test Set Name",
+        TEST.TS_NAME              "Test Case Name",
+        BUG.BG_USER_18            "RICEF" ,
+        BUG.BG_PRIORITY           "Priority"
+
+FROM BUG, TEST, V_LINK_TESTCYCL, TESTCYCL, CYCLE,  RELEASE_CYCLES
+WHERE BUG.BG_BUG_ID = V_LINK_TESTCYCL.LN_BUG_ID
+AND TESTCYCL.TC_TESTCYCL_ID = V_LINK_TESTCYCL.LN_TESTCYCL_ID
+AND TESTCYCL.TC_TEST_ID = TEST.TS_TEST_ID
+AND CYCLE.CY_CYCLE_ID = TESTCYCL.TC_CYCLE_ID
+and RELEASE_CYCLES.RCYC_ID =  BUG.BG_DETECTED_IN_RCYC
+and  RELEASE_CYCLES.RCYC_NAME =  @ReleaseCycle@
+‘’’’’
+
+FINAL - Daily Exec Pull CH Cycle 2Product Test
+SELECT  CYCLE.CY_CYCLE as TestSetName,  TEST.TS_NAME as TestCaseName,  TEST.TS_USER_01 as Team,  TEST.TS_USER_02 as SubTeam,  TESTCYCL.TC_PLAN_SCHEDULING_DATE as Pl_Exec_Date,  TESTCYCL.TC_USER_02 as Pl_Comp_Date,   TESTCYCL.TC_EXEC_DATE  as Exec_Date,  TESTCYCL.TC_STATUS as Status, TEST.TS_TEST_ID as Test_Id,  TESTCYCL.TC_TESTER_NAME as Tester , RELEASE_CYCLES.RCYC_NAME  as Cycle_Name,  CYCLE.CY_USER_01 as TestSetOwner,  CYCLE.CY_USER_03 as OffShoreExec, TESTCYCL.TC_USER_01 as TestRunOrder, CYCLE.CY_VTS  as Modified_Date, TESTCYCL.TC_ACTUAL_TESTER as ActualTester, CYCLE.CY_USER_08 AS PodName
+FROM    TEST , TESTCYCL ,  CYCLE , RELEASE_CYCLES , CYCL_FOLD
+Where   TEST.TS_TEST_ID  = TESTCYCL.TC_TEST_ID
+and  TESTCYCL.TC_CYCLE_ID =  CYCLE.CY_CYCLE_ID
+and  RELEASE_CYCLES.RCYC_ID = CYCLE.CY_ASSIGN_RCYC
+and  CYCL_FOLD.CF_ITEM_ID  =  CYCLE.CY_FOLDER_ID
+and   RELEASE_CYCLES.RCYC_NAME = 'W3_V2 Product Test Cycle 2 (Q4)'
+and  CYCL_FOLD.CF_ITEM_NAME  = 'W3_V2 Product Test Cycle 2 (Q4)'
+
+Consolidated Defect Ageing 
+Query1
+SELECT
+       BUG.BG_BUG_ID "Defect ID",
+       BUG.BG_STATUS "Current Status",
+       BUG.BG_SEVERITY "Severity",
+       BUG.BG_DETECTION_DATE "Detection Date",
+        bg_user_01  "Detected in Team",
+       BUG.BG_USER_03 "Assigned to Team",
+       MAX(CASE PROP.AP_NEW_VALUE WHEN 'New' THEN LOG.AU_TIME  END) "New",
+       MAX(CASE PROP.AP_NEW_VALUE WHEN 'Open' THEN LOG.AU_TIME  END) "Open",
+       /* MAX(CASE PROP.AP_NEW_VALUE WHEN 'Transport Released' THEN LOG.AU_TIME  END) "Transport Released", */
+       MAX(CASE PROP.AP_NEW_VALUE WHEN 'Ready for Retest' THEN LOG.AU_TIME  END) "Ready for Retest",
+       MAX(CASE PROP.AP_NEW_VALUE WHEN 'Reopen' THEN LOG.AU_TIME  END) "Reopen",
+       /* MAX(CASE PROP.AP_NEW_VALUE WHEN 'MRR' THEN LOG.AU_TIME  END) "MRR", */
+       MAX(CASE PROP.AP_NEW_VALUE WHEN 'Fix Pending' THEN LOG.AU_TIME  END) "Fix Pending",
+       /* MAX(CASE PROP.AP_NEW_VALUE WHEN 'Deferred' THEN LOG.AU_TIME  END) "Deferred", */
+       MAX(CASE PROP.AP_NEW_VALUE WHEN 'Resolved' THEN LOG.AU_TIME  END) "Resolved",
+       /* MAX(CASE PROP.AP_NEW_VALUE WHEN 'Closed' THEN LOG.AU_TIME  END) "Closed",
+       MAX(CASE PROP.AP_NEW_VALUE WHEN 'Rejected' THEN LOG.AU_TIME  END) "Rejected" ,  */
+       Rcyc_name  "Detected in Cycle",
+         bg_user_06 "Type",
+         bg_Priority "Priority" /*,
+         BG_EI_DEFECT_TYPE "SM Defect Type",
+       max(case when AP_OLD_VALUE = 'Resolved' and ap_new_value = 'Reopen' then LOG.AU_TIME end) "Resolved - Reopen"   ,
+      Max(case when AP_OLD_VALUE = 'Ready for Retest' and ap_new_value = 'Reopen' then LOG.AU_TIME end) "Ready for Retest - Reopen"  */
+FROM AUDIT_LOG LOG,
+     AUDIT_PROPERTIES PROP,
+     BUG,
+     RELEASE_CYCLES
+WHERE RCYC_NAME In ('W3_V2 HM UAT GL1','W3_V2 Product Test X','W3_V2 Product Test Cycle 2(Q4) - Outliers','W3_V2 Multi-Instance Phase 1 for Product Test','W3_V2 Multi-Instance Phase 2 for Product Test','W3_V2 Multi-Instance Phase 2 for Regression','W3_V2 Regression Test (Q4) - Cycle 4','W3_V2 Multi-Instance Phase 1 for Regression')  AND
+      BUG.BG_DETECTED_IN_RCYC = RELEASE_CYCLES.RCYC_ID AND
+      LOG.AU_ACTION_ID = PROP.AP_ACTION_ID AND
+      LOG.AU_ENTITY_ID = BUG.BG_BUG_ID AND
+      LOG.AU_ENTITY_TYPE = 'BUG' AND
+      LOG.AU_ACTION = 'UPDATE' AND
+      PROP.AP_TABLE_NAME = 'BUG' AND
+      PROP.AP_FIELD_NAME = 'BG_STATUS' AND
+      AP_PROPERTY_NAME = 'Status'   AND
+      (BUG.BG_STATUS In ('New','Open','Fix Pending','Ready for Retest','Reopen')) AND
+      (BUG.BG_SEVERITY In ('1-Critical','2-High'))  AND
+      bg_Priority <> ' '
+
+GROUP BY BUG.BG_BUG_ID, BUG.BG_STATUS, BUG.BG_SEVERITY,  BUG.BG_DETECTION_DATE, bg_user_01, BUG.BG_USER_03, rcyc_name , bg_EI_Defect_type,   bg_user_06 , bg_priority
+ORDER BY BUG.bg_Priority
+
+
+Post Processing
+
+Sub QC_PostProcessing()
+Dim MainWorksheet As Worksheet
+' Make sure your worksheet name matches!
+Set MainWorksheet = ActiveWorkbook.Worksheets("Query1")
+Dim DataRange As Range
+Dim WS1 as Worksheet
+Dim Status as String
+
+Set DataRange = MainWorksheet.UsedRange
+    Sheets("Query1").Select
+    Cells.Select
+    With Selection.Font
+        .Name = "Calibri"
+        .Size = 9
+        .Strikethrough = False
+        .Superscript = False
+        .Subscript = False
+        .OutlineFont = False
+        .Shadow = False
+        .Underline = xlUnderlineStyleNone
+        .ThemeColor = xlThemeColorLight1
+        .TintAndShade = 0
+        .ThemeFont = xlThemeFontMinor
+    End With
+    Range("A1:AD1").Select
+    Selection.Font.Bold = True
+    With Selection.Interior
+        .Pattern = xlSolid
+        .PatternColorIndex = xlAutomatic
+        .Color = 65535
+        .TintAndShade = 0
+        .PatternTintAndShade = 0
+    End With
+    Range("C3").Select
+    Columns("B:B").ColumnWidth = 13.71
+    Columns("E:E").ColumnWidth = 18.57
+    Columns("F:F").ColumnWidth = 21
+    Columns("H:H").ColumnWidth = 14.57
+    Columns("I:I").ColumnWidth = 12.14
+    Columns("M:M").ColumnWidth = 14
+    ActiveWindow.SmallScroll ToRight:=3
+    ActiveWindow.ScrollColumn = 3
+    ActiveWindow.ScrollColumn = 2
+    ActiveWindow.ScrollColumn = 1
+    Rows("1:1").Select
+    Selection.AutoFilter
+    Sheets("Query1").Select
+    Sheets("Query1").Name = "Query1"
+    Sheets("Query1").Select
+    Sheets("Query1").Name = "Dates"
+    Range("B2").Select
+
+    Set WS1 = Sheets("Dates")
+
+    WS1.Select
+
+    WS1.Cells(1,16).Value = "Overall Age"
+    WS1.Cells(1,17).Value = "New - Open"
+    WS1.Cells(1,18).Value = "New - Resolved"
+    WS1.Cells(1,19).Value = "Open - Ready for Retest"
+    WS1.Cells(1,20).Value = "Open - Fix Pending"
+    WS1.Cells(1,21).Value = "Ready for Retest - Resolved"
+    WS1.Cells(1,22).Value = "Fix Pending - Ready for Retest"
+    WS1.Cells(1,23).Value = "Ready for Retest - Reopen"
+    WS1.Cells(1,24).Value = "Resolved - Reopen"
+
+    LastRow = Cells.Find(What:="*", After:=Range("A1"), LookIn:=xlValues, LookAt:= _
+           xlPart, SearchOrder:=xlByRows, SearchDirection:=xlPrevious).row
+    For row = 2 to LastRow
+
+        WS1.Cells(row, 16).Formula = "=Today()- D" & row
+        WS1.Cells(row, 17).Formula = "=If(And(G" & row & "<> """", H" & row & "<>""""), H" & row & "-G" & row & ", If(G" & row & "<> """", Now()- G" & row & ", ""N/A""))"
+        WS1.Cells(row, 18).Formula = "=If(And(G" & row & "<> """", L" & row & "<>""""), L" & row & "-G" & row & ", If(G" & row & "<> """", Now()- G" & row & ", ""N/A""))"
+        WS1.Cells(row, 19).Formula = "=If(And(H" & row & "<> """", I" & row & "<>""""), I" & row & "-H" & row & ", If(H" & row & "<> """", Now()- H" & row & ", ""N/A""))"
+        WS1.Cells(row, 20).Formula = "=If(And(H" & row & "<> """", K" & row & "<>""""), K" & row & "-H" & row & ", If(H" & row & "<> """", Now()- H" & row & ", ""N/A""))"
+        WS1.Cells(row, 21).Formula = "=If(And(I" & row & "<> """", L" & row & "<>""""), L" & row & "-I" & row & ", If(I" & row & "<> """", Now()- I" & row & ", ""N/A""))"
+        WS1.Cells(row, 22).Formula = "=If(And(K" & row & "<> """", I" & row & "<>""""), K" & row & "-I" & row & ", If(K" & row & "<> """", Now()- K" & row & ", ""N/A""))"
+        WS1.Cells(row, 23).Formula = "=If(And(I" & row & "<> """", J" & row & "<>""""), J" & row & "-I" & row & ", If(I" & row & "<> """", Now()- I" & row & ", ""N/A""))"
+        WS1.Cells(row, 24).Formula = "=If(And(L" & row & "<> """", J" & row & "<>""""), L" & row & "-J" & row & ", If(L" & row & "<> """", Now()- L" & row & ", ""N/A""))"
+
+        Range("R2:AD"& LastRow).Select
+        Selection.NumberFormat = "0"
+
+        With Selection
+            .HorizontalAlignment = xlCenter
+            .VerticalAlignment = xlBottom
+            .WrapText = False
+            .Orientation = 0
+            .AddIndent = False
+            .IndentLevel = 0
+            .ShrinkToFit = False
+            .ReadingOrder = xlContext
+            .MergeCells = False
+         End With
+
+         Columns("P:P").EntireColumn.AutoFit
+         Columns("Q:Q").EntireColumn.AutoFit
+         Columns("R:R").EntireColumn.AutoFit
+         Columns("S:S").EntireColumn.AutoFit
+         Columns("T:T").EntireColumn.AutoFit
+         Columns("U:U").EntireColumn.AutoFit
+         Columns("V:V").EntireColumn.AutoFit
+         Columns("W:W").EntireColumn.AutoFit
+         Columns("X:X").EntireColumn.AutoFit
+
+    Next
+End Sub
+
+Re-open Count
+
+Query
+SELECT
+       BUG.BG_BUG_ID "Defect ID",
+       BUG.BG_STATUS "Current Status",
+       BUG.BG_SEVERITY "Severity",
+       Rcyc_name "Detected in Cycle", /*Defect.Detected in Cycle*/
+
+       count(case when AP_OLD_VALUE = 'Resolved' and ap_new_value = 'Reopen' then ap_new_value end) "Resolved - Reopen"   ,
+       count(case when AP_OLD_VALUE = 'Ready for Retest' and ap_new_value = 'Reopen' then ap_new_value end) "Ready for Retest - Reopen"
+
+
+
+FROM AUDIT_LOG LOG,
+     AUDIT_PROPERTIES PROP,
+     BUG,
+     RELEASE_CYCLES
+WHERE RCYC_NAME In ('W3_V2 HM UAT GL1','W3_V2 Product Test X','W3_V2 Product Test Cycle 2(Q4) - Outliers') AND
+      BUG.BG_DETECTED_IN_RCYC = RELEASE_CYCLES.RCYC_ID AND
+      LOG.AU_ACTION_ID = PROP.AP_ACTION_ID AND
+      LOG.AU_ENTITY_ID = BUG.BG_BUG_ID AND
+      LOG.AU_ENTITY_TYPE = 'BUG' AND
+      LOG.AU_ACTION = 'UPDATE' AND
+      PROP.AP_TABLE_NAME = 'BUG' AND
+      PROP.AP_FIELD_NAME in ('BG_STATUS', 'BG_USER_03')/* AND
+      AP_PROPERTY_NAME in ('Status', 'Assigned to Team')  */
+GROUP BY BUG.BG_BUG_ID, BUG.BG_USER_03, BUG.BG_STATUS, BUG.BG_SEVERITY, Rcyc_name, BUG.BG_DETECTION_DATE    , bg_user_01, rcyc_name , bg_user_06 , bg_user_24
+ORDER BY BUG.BG_BUG_ID
+Post processing
+Sub QC_PostProcessing()
+Dim MainWorksheet As Worksheet
+' Make sure your worksheet name matches!
+Set MainWorksheet = ActiveWorkbook.Worksheets("Query2")
+Dim DataRange As Range
+Dim WS1 as Worksheet
+Dim Status as String
+
+Set DataRange = MainWorksheet.UsedRange
+    Sheets("Query2").Select
+    Cells.Select
+    With Selection.Font
+        .Name = "Calibri"
+        .Size = 9
+        .Strikethrough = False
+        .Superscript = False
+        .Subscript = False
+        .OutlineFont = False
+        .Shadow = False
+        .Underline = xlUnderlineStyleNone
+        .ThemeColor = xlThemeColorLight1
+        .TintAndShade = 0
+        .ThemeFont = xlThemeFontMinor
+    End With
+    Range("A1:AD1").Select
+    Selection.Font.Bold = True
+    With Selection.Interior
+        .Pattern = xlSolid
+        .PatternColorIndex = xlAutomatic
+        .Color = 65535
+        .TintAndShade = 0
+        .PatternTintAndShade = 0
+    End With
+    Range("C3").Select
+    Columns("B:B").ColumnWidth = 13.71
+    Columns("E:E").ColumnWidth = 18.57
+    Columns("F:F").ColumnWidth = 21
+    Columns("H:H").ColumnWidth = 14.57
+    Columns("I:I").ColumnWidth = 12.14
+    Columns("M:M").ColumnWidth = 14
+    ActiveWindow.SmallScroll ToRight:=3
+    ActiveWindow.ScrollColumn = 3
+    ActiveWindow.ScrollColumn = 2
+    ActiveWindow.ScrollColumn = 1
+    Rows("1:1").Select
+    Selection.AutoFilter
+    Sheets("Query1").Select
+    Sheets("Query1").Name = "Query1"
+    Sheets("Query2").Select
+    Cells.Select
+    With Selection.Font
+        .Name = "Calibri"
+        .Size = 9
+        .Strikethrough = False
+        .Superscript = False
+        .Subscript = False
+        .OutlineFont = False
+        .Shadow = False
+        .Underline = xlUnderlineStyleNone
+        .ThemeColor = xlThemeColorLight1
+        .TintAndShade = 0
+        .ThemeFont = xlThemeFontMinor
+    End With
+    Range("A1:AD1").Select
+    Selection.Font.Bold = True
+    With Selection.Interior
+        .Pattern = xlSolid
+        .PatternColorIndex = xlAutomatic
+        .Color = 65535
+        .TintAndShade = 0
+        .PatternTintAndShade = 0
+    End With
+    Range("D4").Select
+    Columns("B:B").ColumnWidth = 16.57
+    Columns("E:E").ColumnWidth = 14.14
+    Columns("F:F").ColumnWidth = 13.14
+    Columns("F:F").ColumnWidth = 17.71
+    Columns("G:G").ColumnWidth = 9.86
+    Columns("I:I").ColumnWidth = 15.29
+    Columns("I:I").ColumnWidth = 17
+    Columns("J:J").ColumnWidth = 10.71
+    Columns("J:J").ColumnWidth = 10.86
+    Columns("J:J").ColumnWidth = 13.57
+    Columns("M:M").ColumnWidth = 10.86
+    Sheets("Query2").Select
+    Sheets("Query2").Name = "Count"
+
+    Range("B2").Select
+
+    Set WS1 = Sheets("Dates")
+
+    WS1.Select
+
+    WS1.Cells(1,21).Value = "Defect Age"
+    WS1.Cells(1,22).Value = "Movement Age"
+    WS1.Cells(1,23).Value = "New - Open"
+    WS1.Cells(1,24).Value = "New - Resolved"
+    WS1.Cells(1,25).Value = "Open - Ready for Retest"
+    WS1.Cells(1,26).Value = "Ready for Retest - Resolved"
+    WS1.Cells(1,27).Value = "Resolved - Closed"
+    WS1.Cells(1,28).Value = "Ready for Retest - Reopen"
+    WS1.Cells(1,29).Value = "Resolved - Reopen"
+
+    LastRow = Cells.Find(What:="*", After:=Range("A1"), LookIn:=xlValues, LookAt:= _
+           xlPart, SearchOrder:=xlByRows, SearchDirection:=xlPrevious).row
+    For row = 2 to LastRow
+
+         WS1.Cells(row, 22).Formula = "=Today()- D" & row
+
+         Status = WS1.Cells(row, 2).Value
+
+         Select Case Status
+           Case "New"
+               WS1.Cells(row, 23).Formula = "=Today()- D" & row
+           Case "Open"
+               WS1.Cells(row, 23).Formula = "=Today()- D" & row
+           CASE "Transport Released"
+               WS1.Cells(row, 23).Formula = "=Today()- I" & row
+           CASE "Ready for Retest"
+               WS1.Cells(row, 23).Formula = "=Today()- J" & row
+           CASE "Reopen"
+               WS1.Cells(row, 23).Formula = "=Today()- K" & row
+           CASE "MRR"
+               WS1.Cells(row, 23).Formula = "=Today()- L" & row
+           CASE "Fix Pending"
+               WS1.Cells(row, 23).Formula = "=Today()- M" & row
+           CASE "Deferred"
+               WS1.Cells(row, 23).Formula = "=Today()- N" & row
+           CASE "Resolved"
+               WS1.Cells(row, 22).Formula = "=O" & row & "-D" & row
+               WS1.Cells(row, 23).Value = "N/A"
+           CASE "Closed"
+               If WS1.Cells(row, 15).Value= "" then
+                    WS1.Cells(row, 22).Formula = "=P" & row & "-D" & row
+               Else
+                    WS1.Cells(row, 22).Formula = "=O" & row & "-D" & row
+               End If
+               WS1.Cells(row, 23).Value = "N/A"
+           CASE "Rejected"
+               WS1.Cells(row, 22).Formula = "=Q" & row & "-D" & row
+               WS1.Cells(row, 23).Value = "N/A"
+         End Select
+
+        WS1.Cells(row, 24).Formula = "=If(H" & row & "<> """", H" & row & "-D" & row & ", ""N/A"")"
+        WS1.Cells(row, 25).Formula = "=If(O" & row & "<> """", O" & row & "-D" & row & ", ""N/A"")"
+        WS1.Cells(row, 26).Formula = "=If(AND(H" & row & "<> """", J" & row & "<>""""), J" & row & "-H" & row & ", ""N/A"")"
+        WS1.Cells(row, 27).Formula = "=If(AND(O" & row & "<> """", J" & row & "<>""""), O" & row & "-J" & row & ", ""N/A"")"
+        WS1.Cells(row, 28).Formula = "=If(And(P" & row & "<> """", O" & row & "<>""""), P" & row & "-O" & row & ", ""N/A"")"
+        WS1.Cells(row, 29).Formula = "=If(And(J" & row & "<> """", K" & row & "<>""""), J" & row & "-K" & row & ", ""N/A"")"
+        WS1.Cells(row, 30).Formula = "=If(And(O" & row & "<> """", K" & row & "<>""""), O" & row & "-K" & row & ", ""N/A"")"
+
+        Range("R2:AD"& LastRow).Select
+        Selection.NumberFormat = "0"
+
+        With Selection
+            .HorizontalAlignment = xlCenter
+            .VerticalAlignment = xlBottom
+            .WrapText = False
+            .Orientation = 0
+            .AddIndent = False
+            .IndentLevel = 0
+            .ShrinkToFit = False
+            .ReadingOrder = xlContext
+            .MergeCells = False
+         End With
+
+         Columns("Q:Q").EntireColumn.AutoFit
+         Columns("R:R").EntireColumn.AutoFit
+         Columns("S:S").EntireColumn.AutoFit
+         Columns("P:P").EntireColumn.AutoFit
+         Columns("U:U").EntireColumn.AutoFit
+         Columns("V:V").EntireColumn.AutoFit
+         Columns("W:W").EntireColumn.AutoFit
+         Columns("X:X").EntireColumn.AutoFit
+         Columns("Y:Y").EntireColumn.AutoFit
+         Columns("Z:AD").EntireColumn.AutoFit
+
+    Next
+End Sub
